@@ -101,7 +101,8 @@ pub(crate) fn spawn_webdav_service_unavailable_server() -> (String, JoinHandle<(
             request.extend_from_slice(&buffer[..count]);
             assert!(request.len() < 16 * 1024, "oversized mock request");
         }
-        assert!(request.starts_with(b"MKCOL "));
+        // Manual push now inspects the remote before publishing, so the first
+        // request can be GET/PROPFIND or MKCOL depending on the sync phase.
         stream
             .write_all(
                 b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
