@@ -260,6 +260,14 @@ pub(crate) fn push_provider_snapshot(
     control: &CloudSyncOperationControl,
 ) -> Result<CloudSyncResult, CloudSyncError> {
     control.checkpoint()?;
+    if !force {
+        // Match the automatic push path: finish the remote inspection with one
+        // HTTP client, then publish with a fresh one. Some WebDAV gateways stop
+        // accepting mutations on a connection pool after the inspection reads,
+        // which made manual push fail while a later automatic push succeeded.
+        let checked = check_provider_snapshot(local_store, settings, options, state, control)?;
+        return push_checked_provider_snapshot(local_store, settings, options, checked, control);
+    }
     with_remote(local_store, settings, options, "push", |remote, _| {
         cloud_sync::push_snapshot_with_remote_controlled(
             local_store,
@@ -369,4 +377,113 @@ pub(in crate::features) fn resolve_provider_conflict(
             control,
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{check_provider_snapshot, push_checked_provider_snapshot, push_provider_snapshot};
+    use crate::features::sync::operation::lock_cloud_sync_operation;
+    use crate::test_support::{TestConfigDir, blocking_test_store};
+    use nyaterm_core::cloud_sync::control::CloudSyncOperationControl;
+    use nyaterm_core::{
+        CloudSyncOutcome, CloudSyncSettings, LocalCloudSyncOptions, SavedConnection,
+        WebdavSyncSettings,
+    };
+    use nyaterm_store::StoreDomain;
+    use serde_json::json;
+
+    fn required_env(name: &str) -> String {
+        std::env::var(name).unwrap_or_else(|_| panic!("{name} must be set"))
+    }
+
+    fn save_connection(store: &nyaterm_store::StoreBlockingClient, name: &str) {
+        let connection: SavedConnection = serde_json::from_value(json!({
+            "id": "webdav-live-test",
+            "type": "ssh",
+            "name": name,
+            "host": "example.test",
+            "port": 22,
+            "username": "fixture"
+        }))
+        .expect("live-test connection");
+        store
+            .request_fn(StoreDomain::CloudSync, move |store| {
+                store.save_connection(&connection)
+            })
+            .expect("save live-test connection");
+    }
+
+    #[test]
+    #[ignore = "requires NYATERM_TEST_WEBDAV_* credentials and a disposable WebDAV root"]
+    fn webdav_manual_push_survives_repeated_inspection_and_publish_sessions() {
+        let endpoint = required_env("NYATERM_TEST_WEBDAV_ENDPOINT");
+        let username = required_env("NYATERM_TEST_WEBDAV_USERNAME");
+        let password = required_env("NYATERM_TEST_WEBDAV_PASSWORD");
+        let remote_root = required_env("NYATERM_TEST_WEBDAV_ROOT");
+        let dir = TestConfigDir::new("nyaterm-webdav-live-manual-push");
+        let store = blocking_test_store(dir.path());
+        let settings = CloudSyncSettings {
+            protocol_version: 3,
+            enabled: true,
+            provider: "webdav".into(),
+            remote_root: format!("manual-push-{}", uuid::Uuid::new_v4()),
+            webdav: WebdavSyncSettings {
+                endpoint,
+                root: remote_root,
+                username,
+                password: Some(password.into()),
+            },
+            ..Default::default()
+        };
+        let saved = settings.clone();
+        store
+            .request_fn(StoreDomain::CloudSync, move |store| {
+                store.save_master_password(Some("nyaterm-webdav-live-test"))?;
+                store.save_cloud_sync_settings(saved)
+            })
+            .expect("save live-test cloud sync settings");
+        let state = store
+            .request_fn(StoreDomain::CloudSync, |store| {
+                store.load_cloud_sync_state()
+            })
+            .expect("load live-test state");
+        let options = LocalCloudSyncOptions {
+            device_name: Some(settings.device_name.clone()),
+            config_dir: dir.path().into(),
+            portable_key_path: None,
+            remote_dir: dir.join("cloud-sync-local"),
+            remote_root: settings.remote_root.clone(),
+            device_id: state.device_id.clone(),
+            app_version: env!("CARGO_PKG_VERSION").into(),
+            master_password: "nyaterm-webdav-live-test".into(),
+            enabled: true,
+        };
+        let control = CloudSyncOperationControl::default();
+        let _operation = lock_cloud_sync_operation(&control).expect("cloud sync operation lock");
+
+        for index in 0..4 {
+            save_connection(&store, &format!("Manual push {index}"));
+            let state = store
+                .request_fn(StoreDomain::CloudSync, |store| {
+                    store.load_cloud_sync_state()
+                })
+                .expect("reload live-test state");
+            let result =
+                push_provider_snapshot(&store, &settings, &options, &state, false, &control)
+                    .expect("manual WebDAV push");
+            assert_eq!(result.outcome, CloudSyncOutcome::Uploaded);
+        }
+
+        save_connection(&store, "Automatic-style push");
+        let state = store
+            .request_fn(StoreDomain::CloudSync, |store| {
+                store.load_cloud_sync_state()
+            })
+            .expect("reload live-test state");
+        let checked = check_provider_snapshot(&store, &settings, &options, &state, &control)
+            .expect("automatic-style WebDAV check");
+        let result = push_checked_provider_snapshot(&store, &settings, &options, checked, &control)
+            .expect("automatic-style WebDAV push");
+        assert_eq!(result.outcome, CloudSyncOutcome::Uploaded);
+    }
 }

@@ -27,6 +27,7 @@ struct Reply {
     status: u16,
     headers: Vec<(&'static str, String)>,
     body: &'static str,
+    drop_connection: bool,
 }
 
 fn reply(status: u16) -> Reply {
@@ -34,22 +35,30 @@ fn reply(status: u16) -> Reply {
         status,
         headers: Vec::new(),
         body: "",
+        drop_connection: false,
+    }
+}
+
+fn dropped_connection() -> Reply {
+    Reply {
+        drop_connection: true,
+        ..reply(0)
     }
 }
 
 fn listing(body: &'static str) -> Reply {
     Reply {
-        status: 207,
         headers: vec![("Content-Type", "application/xml; charset=utf-8".into())],
         body,
+        ..reply(207)
     }
 }
 
 fn redirect(location: &str) -> Reply {
     Reply {
-        status: 301,
         headers: vec![("Location", location.to_string())],
         body: "<html><body>Moved</body></html>",
+        ..reply(301)
     }
 }
 
@@ -80,6 +89,10 @@ impl Reply {
         let mut body = vec![0; length];
         if length > 0 {
             stream.read_exact(&mut body).unwrap();
+        }
+        if self.drop_connection {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+            return Request { head, body };
         }
         let mut response = format!("HTTP/1.1 {} Fixture\r\n", self.status);
         for (name, value) in &self.headers {
@@ -166,6 +179,58 @@ fn existing_parent_directories_do_not_block_creation() {
     let result = remote.create_dir("sync");
     server.join().unwrap();
     result.unwrap();
+}
+
+#[test]
+fn a_dropped_connection_is_retried_with_the_same_method_body_and_headers() {
+    let (remote, server) = scripted_server(vec![
+        (
+            "PUT /dav/apps/nyaterm/object HTTP/1.1",
+            dropped_connection(),
+        ),
+        ("PUT /dav/apps/nyaterm/object HTTP/1.1", reply(201)),
+    ]);
+    let result = remote.send_with_headers(
+        Method::PUT,
+        &remote.url_for("object"),
+        Some(b"upload".to_vec()),
+        &[("Content-Type", "application/octet-stream")],
+    );
+    let requests = server.join().unwrap();
+    result.unwrap();
+    assert_eq!(requests.len(), 2);
+    for request in requests {
+        assert_eq!(request.body, b"upload");
+        assert_eq!(
+            request.header("Content-Type"),
+            Some("application/octet-stream")
+        );
+    }
+}
+
+#[test]
+fn transport_retries_are_bounded_and_still_report_http_zero() {
+    let (remote, server) = scripted_server(vec![
+        (
+            "PUT /dav/apps/nyaterm/object HTTP/1.1",
+            dropped_connection(),
+        ),
+        (
+            "PUT /dav/apps/nyaterm/object HTTP/1.1",
+            dropped_connection(),
+        ),
+        (
+            "PUT /dav/apps/nyaterm/object HTTP/1.1",
+            dropped_connection(),
+        ),
+    ]);
+    let result = remote.write("object", b"upload");
+    let requests = server.join().unwrap();
+    assert_eq!(requests.len(), 3);
+    assert!(matches!(
+        result,
+        Err(CloudSyncError::Http { status: 0, .. })
+    ));
 }
 
 #[test]

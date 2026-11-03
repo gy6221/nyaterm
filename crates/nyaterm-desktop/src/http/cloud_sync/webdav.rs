@@ -14,6 +14,13 @@ use super::helpers::{
 
 /// Redirect hops a single WebDAV request may take.
 const MAX_REDIRECTS: usize = 4;
+/// Delivered attempts for a request that fails before receiving a response.
+///
+/// v1's OpenDAL stack installed a RetryLayer around WebDAV. The native adapter
+/// replaced that layer, so a NAS closing an idle keep-alive connection could
+/// turn one dropped request into an immediate `HTTP 0` sync failure.
+const MAX_TRANSPORT_ATTEMPTS: usize = 3;
+const TRANSPORT_RETRY_BASE_DELAY: Duration = Duration::from_millis(100);
 
 #[derive(Clone)]
 pub struct NativeWebdavRemote {
@@ -156,20 +163,48 @@ impl NativeWebdavRemote {
         authorization: Option<String>,
         headers: &[(&str, &str)],
     ) -> Result<zed_reqwest::blocking::Response, CloudSyncError> {
-        let mut request = self.client.request(method, url);
-        if let Some(authorization) = authorization {
-            request = request.header(AUTHORIZATION, authorization);
-        } else if !self.username.is_empty() {
-            request = request.basic_auth(&self.username, self.password.as_deref());
+        let mut attempt = 1;
+        loop {
+            let mut request = self.client.request(method.clone(), url);
+            if let Some(authorization) = authorization.as_deref() {
+                request = request.header(AUTHORIZATION, authorization);
+            } else if !self.username.is_empty() {
+                request = request.basic_auth(&self.username, self.password.as_deref());
+            }
+            if let Some(body) = body.as_ref() {
+                request = request.body(body.clone());
+            }
+            for (name, value) in headers {
+                request = request.header(*name, *value);
+            }
+            match request.send_counted() {
+                Ok(response) => return Ok(response),
+                Err(error)
+                    if attempt < MAX_TRANSPORT_ATTEMPTS
+                        && should_retry_webdav_transport(&error) =>
+                {
+                    tracing::warn!(
+                        attempt,
+                        max_attempts = MAX_TRANSPORT_ATTEMPTS,
+                        method = method.as_str(),
+                        "Retrying WebDAV request after a transport failure"
+                    );
+                    std::thread::sleep(TRANSPORT_RETRY_BASE_DELAY * attempt as u32);
+                    attempt += 1;
+                }
+                Err(error) => return Err(map_webdav_http_error(error)),
+            }
         }
-        if let Some(body) = body {
-            request = request.body(body);
-        }
-        for (name, value) in headers {
-            request = request.header(*name, *value);
-        }
-        request.send_counted().map_err(map_webdav_http_error)
     }
+}
+
+/// Request-layer failures happen before a response exists and are safe to
+/// replay because every WebDAV operation used by sync has idempotent semantics.
+/// Timeouts are excluded so a single attempt cannot silently consume the
+/// operation's whole 30-second budget several times.
+fn should_retry_webdav_transport(error: &zed_reqwest::Error) -> bool {
+    !error.is_timeout()
+        && (error.is_request() || error.is_connect() || error.is_body() || error.is_decode())
 }
 
 impl CloudSyncRemote for NativeWebdavRemote {
