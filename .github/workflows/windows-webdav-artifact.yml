@@ -1,0 +1,100 @@
+name: Windows WebDAV Artifact
+
+# Build a Windows x64 desktop package from a chosen ref without the release
+# pipeline's signing secrets, so a fix can be handed to a user for field
+# testing. This workflow never publishes: it only uploads an artifact.
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Source ref to build (branch, tag, or commit)
+        required: true
+        default: main
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+
+jobs:
+  package:
+    name: Package windows-x64
+    runs-on: windows-2025
+    timeout-minutes: 120
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_ref }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Resolve workspace version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')"
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "Building NyaTerm ${version} from ${{ inputs.source_ref }}"
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+        with:
+          targets: x86_64-pc-windows-msvc
+          cache-key: windows-webdav-artifact
+          cache-on-failure: 'true'
+          save-cache: always
+      - name: Prepare bundled ConPTY
+        run: python scripts/release/prepare_conpty.py
+      - name: Prepare Android native dependencies (Windows MSYS2)
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            git
+            make
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-clang
+      - name: Prepare Android native dependencies
+        shell: msys2 {0}
+        env:
+          TARGET: x86_64-pc-windows-msvc
+        run: python scripts/release/prepare_android.py --target "${TARGET}"
+      - name: Package native application
+        shell: pwsh
+        env:
+          NYATERM_ARTIFACT_VERSION: ${{ steps.version.outputs.version }}
+          NYATERM_VERSION: ${{ steps.version.outputs.version }}
+          TARGET: x86_64-pc-windows-msvc
+        run: |
+          # Git Bash prepends Git's /usr/bin/link.exe, shadowing MSVC's linker.
+          # Preserve the PATH configured by ilammy/msvc-dev-cmd for Rust builds.
+          $linker = (Get-Command link.exe -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
+          if ($linker -notmatch '\\VC\\Tools\\MSVC\\[^\\]+\\bin\\HostX64\\(x64|arm64)\\link\.exe$') {
+            throw "Expected Visual Studio MSVC linker, got: $linker"
+          }
+          Write-Host "Using MSVC linker: $linker"
+          python scripts/release/package_native.py "${env:TARGET}"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Upload Windows client artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: NyaTerm-windows-x64-${{ github.run_id }}-${{ github.run_attempt }}
+          # Native packaging emits a portable ZIP, an NSIS setup EXE, and an MSI
+          # for stable versions. The SHA-256 files accompany them.
+          path: |
+            dist/*.zip
+            dist/*.exe
+            dist/*.msi
+            dist/*.sha256
+          if-no-files-found: error
+          retention-days: 14
