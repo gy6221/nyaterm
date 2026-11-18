@@ -11,7 +11,7 @@ use quick_xml::Reader;
 use quick_xml::events::Event;
 use zed_reqwest::{Method, StatusCode};
 
-use super::helpers::map_s3_http_error;
+use super::helpers::{map_s3_http_error, retry_transient};
 
 #[derive(Clone)]
 pub struct NativeS3Remote {
@@ -178,57 +178,9 @@ impl NativeS3Remote {
 /// keep-alive socket failed the whole sync job with
 /// `S3 request failed (connection reset)`. Reads, listings and deletions are
 /// idempotent and are replayed a couple of times on transient transport
-/// failures; writes keep their single attempt because their outcome is
-/// ambiguous and the publication journal owns that recovery.
-const REQUEST_ATTEMPTS: u32 = 3;
-
-fn retry_transient<T>(
-    mut attempt: impl FnMut() -> Result<T, CloudSyncError>,
-) -> Result<T, CloudSyncError> {
-    let mut delay = Duration::from_millis(200);
-    let mut remaining = REQUEST_ATTEMPTS;
-    loop {
-        remaining -= 1;
-        match attempt() {
-            Err(error) if remaining > 0 && transient(&error) => {
-                tracing::debug!(remaining, "retrying a transient S3 request");
-                std::thread::sleep(delay);
-                delay = delay.saturating_mul(2);
-            }
-            result => return result,
-        }
-    }
-}
-
-fn transient(error: &CloudSyncError) -> bool {
-    match error {
-        CloudSyncError::Storage { kind, .. } => matches!(
-            kind,
-            nyaterm_core::cloud_sync::error::CloudStorageErrorKind::ConnectionReset
-                | nyaterm_core::cloud_sync::error::CloudStorageErrorKind::Timeout
-                | nyaterm_core::cloud_sync::error::CloudStorageErrorKind::Connect
-                | nyaterm_core::cloud_sync::error::CloudStorageErrorKind::Dns
-        ),
-        // A rate limit with an explicit deadline is scheduled by the caller;
-        // replaying it here would ignore the server's instruction.
-        CloudSyncError::Http {
-            status,
-            retry_after_seconds: None,
-            ..
-        } => matches!(status, 408 | 500..=599),
-        // A body that ended early is the same dead socket, discovered while
-        // streaming instead of while waiting for the head.
-        CloudSyncError::Io(source) => matches!(
-            source.kind(),
-            std::io::ErrorKind::ConnectionReset
-                | std::io::ErrorKind::ConnectionAborted
-                | std::io::ErrorKind::UnexpectedEof
-                | std::io::ErrorKind::BrokenPipe
-        ),
-        _ => false,
-    }
-}
-
+/// failures through `helpers::retry_transient`; writes keep their single
+/// attempt because their outcome is ambiguous and the publication journal owns
+/// that recovery.
 impl CloudSyncRemote for NativeS3Remote {
     fn list_sync_files(&self, path: &str) -> Result<Vec<String>, CloudSyncError> {
         let prefix = format!("{}/", path.trim_matches('/'));

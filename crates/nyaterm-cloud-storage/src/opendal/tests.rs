@@ -1025,3 +1025,111 @@ fn progressing_response_can_exceed_read_deadline_but_stalled_response_times_out(
         }
     }
 }
+
+/// Reported in the field on Windows against fnOS WebDAV: a NAS that retires an
+/// idle keep-alive socket closes it with a FIN, and the next request on that
+/// pooled connection is answered with a reset. The native compatibility client
+/// used to send every request exactly once, so the first listing of a sync
+/// failed outright with `WebDAV request failed (connection reset)`.
+#[test]
+fn a_reset_on_the_first_webdav_listing_is_replayed_instead_of_failing_the_sync() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let counter = attempts.clone();
+    let server = Server::new(move |_| {
+        if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+            return Reply::disconnect();
+        }
+        Reply::new(
+            207,
+            "<?xml version=\"1.0\"?><D:multistatus xmlns:D=\"DAV:\">\
+             <D:response><D:href>/dav/apps/nyaterm/sync/</D:href>\
+             <D:propstat><D:prop><D:resourcetype><D:collection/></D:resourcetype></D:prop>\
+             <D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>\
+             <D:response><D:href>/dav/apps/nyaterm/sync/a.bin</D:href>\
+             <D:propstat><D:prop><D:resourcetype/></D:prop>\
+             <D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>\
+             </D:multistatus>",
+        )
+    });
+    let remote = NativeWebdavRemote::new(&server.webdav()).unwrap();
+    let files = remote.list_sync_files("sync").unwrap();
+    assert_eq!(files, vec!["sync/a.bin".to_string()]);
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        2,
+        "the reset attempt is replayed once and succeeds"
+    );
+}
+
+#[test]
+fn a_reset_on_a_webdav_read_or_delete_is_replayed_but_a_write_is_not() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    for method in ["GET", "DELETE", "PUT"] {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let counter = attempts.clone();
+        let server = Server::new(move |_| {
+            if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Reply::disconnect();
+            }
+            Reply::new(200, "body")
+        });
+        let remote = NativeWebdavRemote::new(&server.webdav()).unwrap();
+        // The root object has no parent directory, so a write issues one PUT.
+        let result = match method {
+            "GET" => remote.read_if_exists("object").map(|_| ()),
+            "DELETE" => remote.delete("object"),
+            "PUT" => remote.write("object", b"upload"),
+            _ => unreachable!(),
+        };
+        if method == "PUT" {
+            // An ambiguous transport failure must never replay a mutation.
+            assert!(result.is_err(), "a reset PUT must surface as an error");
+        } else {
+            result.unwrap();
+        }
+        let requests = server.requests.lock().unwrap();
+        assert!(
+            requests.iter().all(|request| request.method == method),
+            "{method}"
+        );
+        assert_eq!(
+            requests.len(),
+            if method == "PUT" { 1 } else { 2 },
+            "{method}"
+        );
+        drop(requests);
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            if method == "PUT" { 1 } else { 2 },
+            "{method}"
+        );
+    }
+}
+
+#[test]
+fn a_webdav_rate_limit_deadline_is_surfaced_without_a_local_replay() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let counter = attempts.clone();
+    let server = Server::new(move |_| {
+        counter.fetch_add(1, Ordering::SeqCst);
+        Reply::new(503, "retry later").header("Retry-After", "7")
+    });
+    let remote = NativeWebdavRemote::new(&server.webdav()).unwrap();
+    assert_eq!(
+        remote
+            .read_if_exists("sync/object")
+            .unwrap_err()
+            .retry_after(),
+        Some(std::time::Duration::from_secs(7))
+    );
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        1,
+        "an explicit server deadline is scheduled by the caller"
+    );
+}

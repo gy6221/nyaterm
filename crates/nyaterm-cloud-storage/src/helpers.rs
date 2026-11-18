@@ -1,5 +1,5 @@
 use std::error::Error as StdError;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use nyaterm_core::cloud_sync::error::CloudStorageErrorKind;
 
@@ -119,6 +119,64 @@ pub(super) fn map_s3_http_error(error: zed_reqwest::Error) -> CloudSyncError {
 }
 pub(super) fn map_webdav_http_error(error: zed_reqwest::Error) -> CloudSyncError {
     safe_http_error("WebDAV", error)
+}
+
+/// NAS WebDAV servers commonly close idle keep-alive sockets without notice.
+/// Reusing one surfaces as an instant "connection reset" on the next request;
+/// retiring pooled sockets early keeps that from hitting the first request after
+/// a pause, and replaying idempotent requests covers a reset that still slips
+/// through. Writes must not be replayed here: their outcome is ambiguous and the
+/// publication journal owns that recovery.
+pub(super) fn retry_transient<T>(
+    mut attempt: impl FnMut() -> Result<T, CloudSyncError>,
+) -> Result<T, CloudSyncError> {
+    const REQUEST_ATTEMPTS: u32 = 3;
+    let mut delay = Duration::from_millis(200);
+    let mut remaining = REQUEST_ATTEMPTS;
+    loop {
+        remaining -= 1;
+        match attempt() {
+            Err(error) if remaining > 0 && transient_cloud_error(&error) => {
+                tracing::debug!(remaining, "retrying a transient cloud storage request");
+                std::thread::sleep(delay);
+                delay = delay.saturating_mul(2);
+            }
+            result => return result,
+        }
+    }
+}
+
+/// Whether a request may be replayed after this error.
+///
+/// Only transport-level failures and 5xx responses without an explicit
+/// `Retry-After` deadline qualify. A rate limit with an explicit deadline is
+/// scheduled by the caller; replaying it here would ignore the server's
+/// instruction.
+pub(super) fn transient_cloud_error(error: &CloudSyncError) -> bool {
+    match error {
+        CloudSyncError::Storage { kind, .. } => matches!(
+            kind,
+            CloudStorageErrorKind::ConnectionReset
+                | CloudStorageErrorKind::Timeout
+                | CloudStorageErrorKind::Connect
+                | CloudStorageErrorKind::Dns
+        ),
+        CloudSyncError::Http {
+            status,
+            retry_after_seconds: None,
+            ..
+        } => matches!(status, 408 | 500..=599),
+        // A body that ended early is the same dead socket, discovered while
+        // streaming instead of while waiting for the head.
+        CloudSyncError::Io(source) => matches!(
+            source.kind(),
+            std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::UnexpectedEof
+                | std::io::ErrorKind::BrokenPipe
+        ),
+        _ => false,
+    }
 }
 
 pub(super) fn normalize_endpoint(endpoint: &str) -> String {

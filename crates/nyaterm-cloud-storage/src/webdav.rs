@@ -1,4 +1,6 @@
 use super::metrics::{CountedRequest, CountedResponse};
+use std::collections::BTreeSet;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use nyaterm_core::{CloudSyncError, CloudSyncRemote, WebdavSyncSettings};
@@ -9,7 +11,7 @@ use zed_reqwest::{Method, StatusCode};
 
 use super::helpers::{
     build_digest_authorization, digest_challenge, map_webdav_http_error, normalize_endpoint,
-    path_and_query, trim_remote_path, webdav_cnonce,
+    path_and_query, retry_transient, trim_remote_path, webdav_cnonce,
 };
 
 /// Redirect hops a single WebDAV request may take.
@@ -22,6 +24,16 @@ pub struct NativeWebdavRemote {
     root: String,
     username: String,
     password: Option<nyaterm_core::SecretString>,
+    /// Collections already confirmed to exist, keyed by endpoint-relative path.
+    ///
+    /// `MKCOL` is not recursive, so `create_dir` walks every segment from the
+    /// provider root. Without this, each published object re-issued the whole
+    /// chain: a sync of a few hundred files opened thousands of connections,
+    /// each carrying one `MKCOL`, which is exactly the churn that made a NAS
+    /// drop sockets mid-run. A `MKCOL` that reports the collection already
+    /// exists (405) also records it, so the walk happens at most once per
+    /// directory per remote instance.
+    created_dirs: Arc<Mutex<BTreeSet<String>>>,
 }
 
 impl NativeWebdavRemote {
@@ -40,6 +52,12 @@ impl NativeWebdavRemote {
             // drops its body, which would silently turn a `PROPFIND` on a
             // slashless collection URL into a `GET` of an HTML index page.
             .redirect(zed_reqwest::redirect::Policy::none())
+            // NAS WebDAV servers (for example fnOS) close idle keep-alive
+            // sockets without notice; reusing one surfaces as an instant
+            // "connection reset" on the next request. Retiring pooled sockets
+            // early keeps that from hitting the first sync request after a
+            // pause, and idempotent requests are replayed as well.
+            .pool_idle_timeout(Duration::from_secs(15))
             .build()
             .map_err(map_webdav_http_error)?;
         Ok(Self {
@@ -48,6 +66,7 @@ impl NativeWebdavRemote {
             root: trim_remote_path(&settings.root),
             username: settings.username.trim().to_string(),
             password: settings.password.clone(),
+            created_dirs: Arc::new(Mutex::new(BTreeSet::new())),
         })
     }
 
@@ -183,6 +202,13 @@ impl NativeWebdavRemote {
         }
         request.send_counted().map_err(map_webdav_http_error)
     }
+
+    fn remember_dir(&self, path: &str) {
+        self.created_dirs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(path.to_string());
+    }
 }
 
 impl CloudSyncRemote for NativeWebdavRemote {
@@ -200,49 +226,67 @@ impl CloudSyncRemote for NativeWebdavRemote {
                 current.push('/');
             }
             current.push_str(segment);
+            // A collection confirmed earlier in this sync is already present;
+            // re-issuing MKCOL for it only burns a connection.
+            let already_created = self
+                .created_dirs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(&current);
+            if already_created {
+                continue;
+            }
             let url = format!("{}/{}/", self.endpoint, current);
             let method = Method::from_bytes(b"MKCOL").map_err(|error| {
                 CloudSyncError::Remote(format!("failed to build WebDAV MKCOL method: {error}"))
             })?;
-            let response = self.send(method, &url, None)?;
-            let status = response.status();
-            let retry = super::helpers::retry_after_seconds(response.headers());
-            let _ = response.bytes_counted();
-            match status {
-                StatusCode::CREATED | StatusCode::OK | StatusCode::METHOD_NOT_ALLOWED => {}
-                status if status.is_success() => {}
-                status => {
-                    return Err(super::helpers::http_failure(
-                        "WebDAV",
-                        "create directory",
-                        status.as_u16(),
-                        retry,
-                    ));
+            // MKCOL is idempotent: a collection that already exists answers
+            // 405 (or 201 again on some servers), so replaying it after a
+            // dead-socket reset cannot corrupt remote state. This walk is the
+            // first request of a sync, which is exactly when a NAS that retired
+            // an idle pooled socket resets the connection.
+            retry_transient(|| {
+                let response = self.send(method.clone(), &url, None)?;
+                let status = response.status();
+                let retry = super::helpers::retry_after_seconds(response.headers());
+                let _ = response.bytes_counted();
+                if status.is_success() || status == StatusCode::METHOD_NOT_ALLOWED {
+                    return Ok(());
                 }
-            }
+                Err(super::helpers::http_failure(
+                    "WebDAV",
+                    "create directory",
+                    status.as_u16(),
+                    retry,
+                ))
+            })?;
+            // Either outcome means the collection exists from here on.
+            self.remember_dir(&current);
         }
         Ok(())
     }
 
     fn read_if_exists(&self, path: &str) -> Result<Option<Vec<u8>>, CloudSyncError> {
         let url = self.url_for(path);
-        let response = self.send(Method::GET, &url, None)?;
-        let status = response.status();
-        let _retry_after_seconds = super::helpers::retry_after_seconds(response.headers());
-        if status == StatusCode::NOT_FOUND {
-            let _ = response.bytes_counted();
-            return Ok(None);
-        }
-        if status.is_success() {
-            return response.bytes_counted().map(|bytes| Some(bytes.to_vec()));
-        }
-        let _body = response.text_counted().unwrap_or_default();
-        Err(super::helpers::http_failure(
-            "WebDAV",
-            "request",
-            status.as_u16(),
-            _retry_after_seconds,
-        ))
+        retry_transient(|| {
+            let response = self.send(Method::GET, &url, None)?;
+            let status = response.status();
+            let retry_after_seconds = super::helpers::retry_after_seconds(response.headers());
+            if status == StatusCode::NOT_FOUND {
+                let _ = response.bytes_counted();
+                return Ok(None);
+            }
+            if status.is_success() {
+                return response.bytes_counted().map(|bytes| Some(bytes.to_vec()));
+            }
+            let _body = response.text_counted().unwrap_or_default();
+            Err(super::helpers::http_failure(
+                "WebDAV",
+                "request",
+                status.as_u16(),
+                retry_after_seconds,
+            ))
+        })
     }
 
     fn write(&self, path: &str, bytes: &[u8]) -> Result<(), CloudSyncError> {
@@ -271,20 +315,23 @@ impl CloudSyncRemote for NativeWebdavRemote {
     }
 
     fn delete(&self, path: &str) -> Result<(), CloudSyncError> {
-        let response = self.send(Method::DELETE, &self.url_for(path), None)?;
-        if response.status().is_success() || response.status() == StatusCode::NOT_FOUND {
-            let _ = response.bytes_counted();
-            return Ok(());
-        }
-        let status = response.status();
-        let _retry_after_seconds = super::helpers::retry_after_seconds(response.headers());
-        let _body = response.text_counted().unwrap_or_default();
-        Err(super::helpers::http_failure(
-            "WebDAV",
-            "request",
-            status.as_u16(),
-            _retry_after_seconds,
-        ))
+        let url = self.url_for(path);
+        retry_transient(|| {
+            let response = self.send(Method::DELETE, &url, None)?;
+            if response.status().is_success() || response.status() == StatusCode::NOT_FOUND {
+                let _ = response.bytes_counted();
+                return Ok(());
+            }
+            let status = response.status();
+            let retry_after_seconds = super::helpers::retry_after_seconds(response.headers());
+            let _body = response.text_counted().unwrap_or_default();
+            Err(super::helpers::http_failure(
+                "WebDAV",
+                "request",
+                status.as_u16(),
+                retry_after_seconds,
+            ))
+        })
     }
 
     fn list_files(&self, path: &str) -> Result<Vec<String>, CloudSyncError> {
@@ -309,39 +356,41 @@ impl NativeWebdavRemote {
         let method = Method::from_bytes(b"PROPFIND").map_err(|error| {
             CloudSyncError::Remote(format!("failed to build WebDAV PROPFIND method: {error}"))
         })?;
-        let response = self.send_with_headers(
-            method,
-            &self.collection_url(path),
-            Some(b"<?xml version=\"1.0\"?><propfind xmlns=\"DAV:\"><prop><resourcetype/></prop></propfind>".to_vec()),
-            &[("Depth", "1"), ("Content-Type", "application/xml")],
-        )?;
-        let status = response.status();
-        let _retry_after_seconds = super::helpers::retry_after_seconds(response.headers());
-        if status == StatusCode::NOT_FOUND {
-            let _ = response.bytes_counted();
-            return Ok(Vec::new());
-        }
-        let body = response.text_counted()?;
-        if !status.is_success() && status.as_u16() != 207 {
-            return Err(super::helpers::http_failure(
-                "WebDAV",
-                "request",
-                status.as_u16(),
-                _retry_after_seconds,
-            ));
-        }
-        (if v4 {
-            parse_webdav_names(&body, true)
-        } else {
-            parse_webdav_file_names(&body)
-        })
-        .map_err(|error| describe_listing_failure(error, status, &body))
-        .map(|names| {
-            let prefix = trim_remote_path(path);
-            names
-                .into_iter()
-                .map(|name| format!("{prefix}/{name}"))
-                .collect()
+        retry_transient(|| {
+            let response = self.send_with_headers(
+                method.clone(),
+                &self.collection_url(path),
+                Some(b"<?xml version=\"1.0\"?><propfind xmlns=\"DAV:\"><prop><resourcetype/></prop></propfind>".to_vec()),
+                &[("Depth", "1"), ("Content-Type", "application/xml")],
+            )?;
+            let status = response.status();
+            let retry_after_seconds = super::helpers::retry_after_seconds(response.headers());
+            if status == StatusCode::NOT_FOUND {
+                let _ = response.bytes_counted();
+                return Ok(Vec::new());
+            }
+            let body = response.text_counted()?;
+            if !status.is_success() && status.as_u16() != 207 {
+                return Err(super::helpers::http_failure(
+                    "WebDAV",
+                    "request",
+                    status.as_u16(),
+                    retry_after_seconds,
+                ));
+            }
+            (if v4 {
+                parse_webdav_names(&body, true)
+            } else {
+                parse_webdav_file_names(&body)
+            })
+            .map_err(|error| describe_listing_failure(error, status, &body))
+            .map(|names| {
+                let prefix = trim_remote_path(path);
+                names
+                    .into_iter()
+                    .map(|name| format!("{prefix}/{name}"))
+                    .collect()
+            })
         })
     }
 }

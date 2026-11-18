@@ -613,3 +613,129 @@ fn a_fifth_redirect_is_rejected_without_resetting_the_budget_after_digest() {
         );
     }
 }
+
+#[test]
+fn repeated_writes_do_not_reissue_mkcol_for_directories_that_already_exist() {
+    use crate::test_support::http::{Reply as HttpReply, Server};
+
+    let server = Server::new(|_| HttpReply::new(201, ""));
+    let remote = NativeWebdavRemote::new(&server.webdav()).unwrap();
+    // Each write creates the same parent chain; MKCOL is not recursive, so the
+    // first walk must happen exactly once and never again for that chain.
+    for name in ["sync/a.bin", "sync/b.bin", "sync/c.bin"] {
+        remote.write(name, b"body").unwrap();
+    }
+    let requests = server.requests.lock().unwrap();
+    let mkcol: Vec<_> = requests
+        .iter()
+        .filter(|request| request.method == "MKCOL")
+        .map(|request| request.target.clone())
+        .collect();
+    let unique: std::collections::BTreeSet<_> = mkcol.iter().cloned().collect();
+    assert_eq!(
+        mkcol.len(),
+        unique.len(),
+        "a collection must be requested at most once per sync: {mkcol:?}"
+    );
+    // The walk starts at the configured provider root, so its own parent
+    // segments are created before the protocol directory.
+    assert!(
+        mkcol.iter().all(|target| target.starts_with("/dav/apps/")),
+        "only the walked chain is created: {mkcol:?}"
+    );
+    assert_eq!(
+        mkcol,
+        vec![
+            "/dav/apps/".to_string(),
+            "/dav/apps/nyaterm/".to_string(),
+            "/dav/apps/nyaterm/sync/".to_string(),
+        ],
+        "the chain is walked exactly once for three writes"
+    );
+}
+
+#[test]
+fn a_directory_reported_as_existing_is_not_requested_again() {
+    use crate::test_support::http::{Reply as HttpReply, Server};
+
+    // fnOS answers MKCOL for an existing collection with 405 instead of 201.
+    let server = Server::new(|request| {
+        if request.method == "MKCOL" {
+            HttpReply::new(405, "Method Not Allowed")
+        } else {
+            HttpReply::new(201, "")
+        }
+    });
+    let remote = NativeWebdavRemote::new(&server.webdav()).unwrap();
+    remote.write("sync/first.bin", b"one").unwrap();
+    remote.write("sync/second.bin", b"two").unwrap();
+    let requests = server.requests.lock().unwrap();
+    let mkcol = requests
+        .iter()
+        .filter(|request| request.method == "MKCOL")
+        .count();
+    let put = requests
+        .iter()
+        .filter(|request| request.method == "PUT")
+        .count();
+    assert_eq!(put, 2, "both writes must reach the remote");
+    // One walk of `apps-sync`-style segments for the first write only.
+    assert!(
+        mkcol < 2 * 2,
+        "the existing-directory walk must not repeat per write: {mkcol} MKCOL for 2 writes"
+    );
+}
+
+/// The directory walk is the first request of a sync. On a NAS that retired an
+/// idle pooled socket, that very first MKCOL is the one answered with a reset.
+#[test]
+fn a_reset_on_the_first_mkcol_is_replayed_because_mkcol_is_idempotent() {
+    use crate::test_support::http::{Reply as HttpReply, Server};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let counter = attempts.clone();
+    let server = Server::new(move |request| {
+        if request.method == "MKCOL" && counter.fetch_add(1, Ordering::SeqCst) == 0 {
+            return HttpReply::disconnect();
+        }
+        HttpReply::new(201, "")
+    });
+    let remote = NativeWebdavRemote::new(&server.webdav()).unwrap();
+    remote.create_dir("sync").unwrap();
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        4,
+        "the reset MKCOL is replayed, then the remaining two segments are walked"
+    );
+    let requests = server.requests.lock().unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.method == "MKCOL")
+            .count(),
+        4
+    );
+}
+
+#[test]
+fn a_conflicting_mkcol_is_not_replayed() {
+    use crate::test_support::http::{Reply as HttpReply, Server};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let counter = attempts.clone();
+    let server = Server::new(move |_| {
+        counter.fetch_add(1, Ordering::SeqCst);
+        HttpReply::new(409, "Conflict")
+    });
+    let remote = NativeWebdavRemote::new(&server.webdav()).unwrap();
+    assert!(remote.create_dir("sync").is_err());
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        1,
+        "a parent conflict is permanent and must not be replayed"
+    );
+}
