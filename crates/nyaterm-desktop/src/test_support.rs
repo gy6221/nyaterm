@@ -59,54 +59,72 @@ pub(crate) fn spawn_webdav_service_unavailable_server() -> (String, JoinHandle<(
         .set_nonblocking(true)
         .expect("nonblocking listener");
     let server = std::thread::spawn(move || {
-        // Sync jobs queue behind the process-wide lock during parallel test runs.
-        let deadline = Instant::now() + Duration::from_secs(60);
-        let mut stream = loop {
-            match listener.accept() {
-                Ok((stream, _)) => break stream,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    assert!(Instant::now() < deadline, "WebDAV request was not sent");
-                    std::thread::sleep(Duration::from_millis(5));
+        // A definite 503 is a transient failure, so the client replays it. Keep
+        // answering until the client stops, rather than serving one request and
+        // then letting the next connection fail as a reset, which would surface
+        // as the wrong error.
+        let first_deadline = Instant::now() + Duration::from_secs(60);
+        // Once the first request arrived, the client retries on a backoff that
+        // tops out well under this window, so a short lull means it is done.
+        let mut idle_deadline = first_deadline;
+        let mut served = false;
+        loop {
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if Instant::now() >= idle_deadline {
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("mock accept failed: {error}"),
                 }
-                Err(error) => panic!("mock accept failed: {error}"),
-            }
-        };
-        stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .expect("read timeout");
-        let mut request = Vec::new();
-        let mut buffer = [0; 1024];
-        let read_deadline = Instant::now() + Duration::from_secs(15);
-        while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
-            let count = match stream.read(&mut buffer) {
-                Ok(count) => count,
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        std::io::ErrorKind::WouldBlock
-                            | std::io::ErrorKind::TimedOut
-                            | std::io::ErrorKind::Interrupted
-                    ) =>
-                {
-                    assert!(
-                        Instant::now() < read_deadline,
-                        "WebDAV request headers timed out"
-                    );
-                    std::thread::sleep(Duration::from_millis(5));
-                    continue;
-                }
-                Err(error) => panic!("mock request headers: {error}"),
             };
-            assert!(count > 0, "incomplete request");
-            request.extend_from_slice(&buffer[..count]);
-            assert!(request.len() < 16 * 1024, "oversized mock request");
+            assert!(!served || Instant::now() < idle_deadline + Duration::from_secs(5));
+            served = true;
+            idle_deadline = Instant::now() + Duration::from_secs(5);
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("read timeout");
+            let mut request = Vec::new();
+            let mut buffer = [0; 1024];
+            let read_deadline = Instant::now() + Duration::from_secs(15);
+            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let count = match stream.read(&mut buffer) {
+                    Ok(count) => count,
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock
+                                | std::io::ErrorKind::TimedOut
+                                | std::io::ErrorKind::Interrupted
+                        ) =>
+                    {
+                        assert!(
+                            Instant::now() < read_deadline,
+                            "WebDAV request headers timed out"
+                        );
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(error) => panic!("mock request headers: {error}"),
+                };
+                assert!(count > 0, "incomplete request");
+                request.extend_from_slice(&buffer[..count]);
+                assert!(request.len() < 16 * 1024, "oversized mock request");
+            }
+            assert!(request.starts_with(b"MKCOL "));
+            if stream
+                .write_all(
+                    b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .is_err()
+            {
+                return;
+            }
+            let _ = stream.shutdown(std::net::Shutdown::Write);
         }
-        assert!(request.starts_with(b"MKCOL "));
-        stream
-            .write_all(
-                b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-            )
-            .expect("mock response");
     });
     (endpoint, server)
 }
