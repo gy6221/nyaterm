@@ -50,20 +50,32 @@ jobs:
           cache-key: windows-webdav-artifact
           cache-on-failure: 'true'
           save-cache: always
+      - name: Install Android native build tools
+        shell: pwsh
+        run: choco install llvm -y --no-progress
+      - name: Install NSIS
+        shell: pwsh
+        run: ./scripts/ci/install-nsis.ps1
+      - name: Install .NET for WiX
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - name: Install WiX
+        shell: pwsh
+        run: ./scripts/ci/install-wix.ps1
+      - name: Test MSI packaging contracts
+        run: python scripts/ci/test_scripts.py --suite windows-msi
       - name: Prepare bundled ConPTY
         run: python scripts/release/prepare_conpty.py
-      - name: Prepare Android native dependencies (Windows MSYS2)
+      - name: Set up MSYS2 for Android native dependencies
         uses: msys2/setup-msys2@v2
         with:
-          msystem: UCRT64
-          update: true
-          install: >-
-            git
-            make
-            mingw-w64-ucrt-x86_64-gcc
-            mingw-w64-ucrt-x86_64-cmake
-            mingw-w64-ucrt-x86_64-ninja
-            mingw-w64-ucrt-x86_64-clang
+          msystem: MSYS
+          # Inherit the Windows PATH so the MSYS2 shell can find `python`, which
+          # prepare_android.py is invoked through. Without this the step fails
+          # with "python: command not found" (exit code 127).
+          path-type: inherit
+          install: make
       - name: Prepare Android native dependencies
         shell: msys2 {0}
         env:
