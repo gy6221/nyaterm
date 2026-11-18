@@ -1133,3 +1133,44 @@ fn a_webdav_rate_limit_deadline_is_surfaced_without_a_local_replay() {
         "an explicit server deadline is scheduled by the caller"
     );
 }
+
+/// Reported in the field: sync to an fnOS NAS failed intermittently only while
+/// the Windows system proxy was enabled. xray rewrites the NAS's
+/// `Connection: close` into `Connection: keep-alive` with a 60 second timeout,
+/// so the client pools a socket the server already closed and the next request
+/// fails with an immediate reset. Loading local endpoints must never be proxied.
+#[test]
+fn local_and_private_endpoints_bypass_the_system_proxy() {
+    use super::transport::is_direct_host;
+    for direct in [
+        "http://localhost:5005/dav/",
+        "http://127.0.0.1:5005/dav/",
+        "http://127.1.2.3/dav/",
+        "http://192.168.11.209:5005/dav/",
+        "http://10.0.0.5/dav/",
+        "http://172.16.4.4/dav/",
+        "http://172.31.255.254/dav/",
+        "http://169.254.10.10/dav/",
+        "http://100.64.0.7/dav/",
+        "http://[::1]:5005/dav/",
+        "http://[fd00::1]/dav/",
+    ] {
+        assert!(
+            is_direct_host(&url::Url::parse(direct).unwrap()),
+            "{direct} must bypass the proxy"
+        );
+    }
+    // Public providers still follow the system proxy.
+    for proxied in [
+        "https://graph.microsoft.com/v1.0/",
+        "https://www.googleapis.com/drive/v3/",
+        "https://api.github.com/",
+        "http://172.32.0.1/dav/",
+        "http://192.169.0.1/dav/",
+    ] {
+        assert!(
+            !is_direct_host(&url::Url::parse(proxied).unwrap()),
+            "{proxied} must keep the proxy"
+        );
+    }
+}

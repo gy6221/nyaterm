@@ -16,6 +16,113 @@ use crate::helpers::{
 };
 use crate::webdav::{redirect_keeps_credentials, redirect_target};
 
+/// Hosts that must reach the endpoint directly instead of through a proxy.
+///
+/// A NAS WebDAV endpoint commonly lives on a loopback or RFC 1918 address, and
+/// a local proxy is a forwarding detour at best. Worse, a proxy may rewrite the
+/// connection semantics: an fnOS server closes every connection after its
+/// response, but xray was observed injecting `Connection: keep-alive` and
+/// `Keep-Alive: timeout=60`. A client that trusts that header returns the socket
+/// to its idle pool, reuses a connection the server already closed, and fails
+/// the next request with an immediate reset.
+///
+/// The Windows `ProxyOverride` list cannot be relied on for this: it is written
+/// as `192.168.*`, which is not a CIDR range, so a URL whose host is an IP never
+/// matches it and the request is proxied anyway. `is_direct_host` therefore
+/// classifies the address itself.
+const DIRECT_HOST_SUFFIXES: [&str; 1] = ["localhost"];
+
+/// Whether a request target must be contacted without a proxy.
+///
+/// Loopback, link-local and private endpoints are reached directly. Everything
+/// else keeps the system proxy, which public providers need.
+pub(super) fn is_direct_host(url: &url::Url) -> bool {
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let lower = host.to_ascii_lowercase();
+    if DIRECT_HOST_SUFFIXES
+        .iter()
+        .any(|suffix| lower == *suffix || lower.ends_with(&format!(".{suffix}")))
+    {
+        return true;
+    }
+    // A bracketed IPv6 literal is not a parseable address.
+    let unbracketed = host.trim_start_matches('[').trim_end_matches(']');
+    let Ok(ip) = unbracketed.parse::<std::net::IpAddr>() else {
+        return false;
+    };
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            // Covers loopback, RFC 1918 private space and link-local.
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                // 100.64.0.0/10 CGNAT, which a home NAS may sit behind.
+                || (u32::from(v4) & 0xFFC0_0000) == 0x6440_0000
+        }
+        // Loopback and fc00::/7 unique-local.
+        std::net::IpAddr::V6(v6) => v6.is_loopback() || (v6.segments()[0] & 0xFE00) == 0xFC00,
+    }
+}
+
+/// The configured HTTP proxy, if the platform has one enabled.
+///
+/// Read from the same environment and registry sources reqwest would consult,
+/// so a user's proxy still applies to public endpoints.
+fn system_proxy() -> Result<String, ()> {
+    for key in ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"] {
+        if let Ok(value) = std::env::var(key) {
+            let value = value.trim().to_string();
+            if !value.is_empty() {
+                return Ok(value);
+            }
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        // `ProxyEnable` and `ProxyServer` are what the Windows settings UI edits.
+        let output = std::process::Command::new("reg")
+            .args([
+                "query",
+                r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+                "/v",
+                "ProxyEnable",
+            ])
+            .output()
+            .ok();
+        let enabled = output
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).to_string())
+            .is_some_and(|text| text.contains("0x1"));
+        if enabled {
+            let server = std::process::Command::new("reg")
+                .args([
+                    "query",
+                    r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+                    "/v",
+                    "ProxyServer",
+                ])
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+                .map(|output| String::from_utf8_lossy(&output.stdout).to_string());
+            if let Some(server) = server
+                && let Some(value) = server.split_whitespace().last()
+                && !value.is_empty()
+            {
+                let value = if value.contains("://") {
+                    value.to_string()
+                } else {
+                    format!("http://{value}")
+                };
+                return Ok(value);
+            }
+        }
+    }
+    Err(())
+}
+
 #[derive(Clone)]
 pub(super) struct Transport {
     client: zed_reqwest::Client,
@@ -63,22 +170,38 @@ impl Transport {
         timeout: Duration,
         read_timeout: Duration,
     ) -> opendal::Result<Self> {
+        let mut builder = zed_reqwest::Client::builder()
+            // Total deadline plus a per-read stall detector: a slow body
+            // that keeps delivering bytes may take longer than the connect
+            // budget, while a silent connection still fails promptly.
+            .timeout(timeout)
+            .read_timeout(read_timeout)
+            .connect_timeout(timeout.min(Duration::from_secs(10)))
+            // Gateways and NAS S3 servers close idle keep-alive sockets
+            // without notice; reusing one surfaces as an instant
+            // connection reset on the next object request.
+            .pool_idle_timeout(Duration::from_secs(15))
+            .redirect_policy(zed_reqwest::redirect::Policy::none())
+            .user_agent("NyaTerm");
+        // Automatic selection is disabled and re-added here so the bypass
+        // decision is explicit. reqwest's Windows bypass parsing cannot solve
+        // this: the registry list is written as `192.168.*`, which is not a
+        // CIDR range, so a URL whose host is an IP literal never matches it and
+        // a local NAS ends up proxied anyway.
+        builder = builder.no_proxy();
+        if let Ok(proxy) = system_proxy()
+            && let Ok(parsed) = url::Url::parse(&proxy)
+        {
+            builder = builder.proxy(zed_reqwest::Proxy::custom(move |url| {
+                if is_direct_host(url) {
+                    None
+                } else {
+                    Some(parsed.clone())
+                }
+            }));
+        }
         Ok(Self {
-            client: zed_reqwest::Client::builder()
-                // Total deadline plus a per-read stall detector: a slow body
-                // that keeps delivering bytes may take longer than the connect
-                // budget, while a silent connection still fails promptly.
-                .timeout(timeout)
-                .read_timeout(read_timeout)
-                .connect_timeout(timeout.min(Duration::from_secs(10)))
-                // Gateways and NAS S3 servers close idle keep-alive sockets
-                // without notice; reusing one surfaces as an instant
-                // connection reset on the next object request.
-                .pool_idle_timeout(Duration::from_secs(15))
-                .redirect_policy(zed_reqwest::redirect::Policy::none())
-                .user_agent("NyaTerm")
-                .build()
-                .map_err(transport_error)?,
+            client: builder.build().map_err(transport_error)?,
             webdav: webdav
                 .map(|settings| (settings.username.trim().into(), settings.password.clone())),
             stats,
